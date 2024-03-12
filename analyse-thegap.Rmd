@@ -1,0 +1,387 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(kableExtra)
+library(beeswarm)
+library(lubridate)
+library(googlesheets4)
+library(ggrepel)
+library(writexl)
+library(ggbeeswarm)
+
+options(scipen=999)
+```
+
+
+# Global Data
+
+## Load full otb data
+```{r}
+#current full otb dataset
+full_otb <- readr::read_csv("data/otb-current.csv")
+
+#historiek voor geselecteerde indicatoren
+hist_otb <- read_excel("data/otb-hist.xlsx") %>% 
+  mutate(periodStartDate = ymd(periodStartDate)) %>% 
+  filter(periodStartDate >= ymd("2018-01-01"))
+  
+```
+
+## Search column names
+```{r}
+all_names_otb <- names(full_otb) %>% as_data_frame()
+
+#search variables
+all_names_otb %>% 
+  filter(grepl("women", value, ignore.case=T)) %>% 
+  mutate(value = trimws(value))
+```
+
+# Datawrangling
+
+### Company selection
+```{r}
+#load stock listed companies
+stocklisted_raw <- read_sheet("https://docs.google.com/spreadsheets/d/1MclclCt9OAQbO_T3e-og9R7h6skIdaeH2gBbi2z11Js/edit#gid=1783672752", sheet="companies-raw") %>% 
+  clean_names() %>% 
+  group_by(ondernemingsnummer) %>% 
+  mutate(
+    count= n()
+  ) %>% 
+  ungroup() 
+
+#selection of companies
+df_stocklisted_select <- stocklisted_raw %>% 
+  filter(markt %in% c("CONTINUMARKT", "BEL20", "ALTERNEXT", "FIXING")) %>% #euronext markten
+  filter(is.na(invest_holding)) %>% #geen investeringsholdings
+  filter(!is.na(ondernemingsnummer)) #bekend ondernemingsnummer
+
+#export company selection to sheet
+df_stocklisted_select %>% 
+  select(name_nl, ondernemingsnummer, isin) %>% 
+  write_sheet("https://docs.google.com/spreadsheets/d/1MclclCt9OAQbO_T3e-og9R7h6skIdaeH2gBbi2z11Js/edit#gid=1783672752", sheet="companies-select")
+```
+### otb-checks
+```{r}
+
+#filter otb for stock listed companies
+otb_meta <- full_otb %>% 
+  filter(vat %in% df_stocklisted_select$ondernemingsnummer) %>% 
+  arrange(desc(vat)) %>% 
+  select(
+         vat,
+         employeeCount,
+         avg_n_employees_fte = averageNumberEmployeesPersonnelRegisterTotalFullTimeEquivalents,
+         avg_n_employees_fte_men = averageNumberEmployeesPersonnelRegisterTotalFullTimeEquivalentsMen,
+         avg_n_employees_fte_women = averageNumberEmployeesPersonnelRegisterTotalFullTimeEquivalentsWomen
+  )
+
+#Welke beursgenoteerde bedrijven (stocklisted) zitten niet in de data van openthebox (full_otb)?
+df_stocklisted_select %>% 
+  filter(!ondernemingsnummer %in% c(full_otb$vat))
+```
+
+### create dataset and calculate pay gap
+```{r}
+
+
+df_full <- df_stocklisted_select %>% 
+  left_join(
+    hist_otb, by=c("ondernemingsnummer" = "vat")
+  ) %>% 
+  left_join(
+    otb_meta, by=c("ondernemingsnummer" = "vat")
+  ) %>% 
+  mutate(
+    sector = tolower(sector),
+    year = year(floor_date(periodStartDate, "year"))) %>% 
+  rename(
+        uren_man = numberHoursActuallyWorkedTotalMen, 
+         uren_vrouw = numberHoursActuallyWorkedTotalWomen,
+         personeelskost_man = personnelCostsTotalMen, 
+         personeelskost_vrouw = personnelCostsTotalWomen
+  ) %>% 
+   mutate(
+    uurloon_man = personeelskost_man / uren_man,
+    uurloon_vrouw = personeelskost_vrouw / uren_vrouw,
+    loonkloof = ((uurloon_vrouw - uurloon_man) / uurloon_man),
+    verschil_uurloon = uurloon_man - uurloon_vrouw,
+        kosten_naar_0pct = case_when(
+      verschil_uurloon > 0 ~ verschil_uurloon * uren_vrouw, # Als mannen meer verdienen
+      verschil_uurloon < 0 ~ abs(verschil_uurloon) * uren_man, # Als vrouwen meer verdienen
+      TRUE ~ 0 # Geen actie nodig als er geen loonkloof is
+    ),
+        kosten_naar_5pct = case_when(
+      abs(loonkloof) > 0.05 & verschil_uurloon > 0 ~ (verschil_uurloon*0.95) * uren_vrouw, # Als mannen meer verdienen
+      abs(loonkloof) > 0.05 & verschil_uurloon < 0 ~ (abs(verschil_uurloon)*0.95) * uren_man, # Als vrouwen meer verdienen
+      TRUE ~ 0
+    ),
+          cat_loonkloof = case_when(
+        loonkloof > 0.05 ~ "+5%",
+        loonkloof <= 0.05 & loonkloof >= 0 ~ "0 tot 5%",
+        loonkloof >= -0.05 & loonkloof <= 0 ~ "0 tot -5%%",
+        loonkloof < -0.05 ~ "<-5%"
+      )
+    ) %>% 
+  filter(!is.na(loonkloof)) 
+
+#subset with only current year
+df_full_current <- df_full %>% 
+  filter(year >= ymd("2022-01-01"))
+
+
+
+```
+
+### Check: Loonkloof onbekend wegens NA's?
+
+```{r}
+df_full_current %>% 
+  filter(is.na(loonkloof)) 
+```
+
+### Export available companies
+```{r}
+#export companies for which data is available
+# df_full_current %>% 
+#   select(name_nl, ondernemingsnummer) %>% 
+#   write_sheet(ss="https://docs.google.com/spreadsheets/d/1MclclCt9OAQbO_T3e-og9R7h6skIdaeH2gBbi2z11Js/edit#gid=0", sheet="companies-available")
+```
+
+
+
+# Analyse 
+
+## Algemeen
+### Meta-data
+```{r}
+df_full_current %>% 
+  summarize(
+    n_companies = n(),
+    sum_fte= sum(avg_n_employees_fte, na.rm=T)
+  )
+```
+
+### groepering volgens drempelwaarden
+```{r}
+
+df_full_current %>% 
+  group_by(cat_loonkloof) %>% 
+  summarize(count = n()) %>% 
+  ungroup() %>% 
+  mutate(
+    total = sum(count),
+    pct = round(count / total, 3)
+    ) 
+
+```
+
+### Mediane kloof
+```{r}
+quantile(abs(df_full_current$loonkloof))
+```
+
+### Scatterplot
+```{r}
+
+same_y <- data.frame(x = unique(df_full_current$uurloon_man)) %>% 
+    mutate(y = x)
+
+higher_y <- data.frame(x = unique(df_full_current$uurloon_man)) %>% 
+  mutate(y = x * 1.05)
+
+lower_y <- data.frame(x = unique(df_full_current$uurloon_man)) %>% 
+  mutate(y = x * 0.95)
+
+df_full_current %>% 
+  ggplot(aes(x=uurloon_man, y=uurloon_vrouw)) +
+  geom_point(alpha=0.5,) +
+  geom_text_repel(size=1.5, aes(label=name_nl)) +
+  geom_line(data = same_y, aes(x = x, y = y)) +
+  geom_line(data = higher_y, aes(x = x, y = y), linetype="dashed") +
+  geom_line(data = lower_y, aes(x = x, y = y), linetype="dashed") +
+  scale_x_log10() +
+  scale_y_log10() +
+  theme_minimal() 
+
+```
+
+### Top 10 loonkloof
+```{r}
+#loonkloof sterkst voor vrouwen
+df_full_current %>% 
+  mutate(loonkloof_sort = abs(loonkloof)) %>% 
+  arrange(desc(loonkloof_sort)) %>% 
+  select(name_nl, sector, loonkloof, uurloon_man, uurloon_vrouw) %>% 
+  head(10) %>% 
+  kbl()
+
+```
+
+
+
+
+### Loonkloof volgens sector
+
+```{r}
+#mediane loonkloof
+paygap_by_sector_median <- df_full_current %>%
+  group_by(sector) %>%
+  summarize(
+    median_paygap = median(abs(loonkloof)),
+    aantal_bedrijven = n()
+  ) %>%
+  filter(aantal_bedrijven > 2) %>%
+  arrange(desc(median_paygap))
+
+paygap_by_sector_median
+
+#plot met loonkloof volgens sector
+df_full_current %>% 
+  group_by(sector) %>% 
+  filter(n() > 2) %>% 
+  ungroup() %>% 
+  mutate(
+    sector = factor(sector, levels=rev(paygap_by_sector_median$sector))
+  ) %>% 
+  ggplot(aes(x=loonkloof, y=sector, label=name_nl)) + 
+  geom_boxplot() +
+  geom_beeswarm(cex = 3, priority = "density") +
+  geom_vline(xintercept=0) +
+  theme(legend.position="none") +
+  geom_text_repel(data=df_full_current %>% filter(abs(loonkloof) > 0.25), aes(label=name_nl), size=3)
+
+# berekenen van paygap op volledige sector ipv mediaan van bedrijven
+paygap_by_sector <- df_full_current %>% 
+  group_by(sector) %>% 
+  filter(n() > 2) %>% 
+  summarize(
+    uren_man = sum(uren_man),
+    uren_vrouw = sum(uren_vrouw),
+    personeelskost_man = sum(personeelskost_man), 
+    personeelskost_vrouw = sum(personeelskost_vrouw)
+         ) %>% 
+  ungroup() %>% 
+    mutate(
+    uurloon_man = personeelskost_man / uren_man,
+    uurloon_vrouw = personeelskost_vrouw / uren_vrouw,
+    loonkloof = ((uurloon_vrouw - uurloon_man) / uurloon_man)
+  ) %>% 
+arrange(desc(abs(loonkloof))) %>% 
+  select(sector, loonkloof)
+
+paygap_by_sector
+```
+### Loonkloof volgens werknemers
+```{r}
+df_full_current %>% 
+  ggplot(aes(x=avg_n_employees_fte, y=abs(loonkloof))) +
+  geom_point() +
+  scale_x_log10() +
+  geom_smooth(method="lm", se=F)
+
+employee_ntile_payGap <- df_full_current %>% 
+  filter(!is.na(avg_n_employees_fte)) %>% 
+  mutate(employee_ntile = ntile(avg_n_employees_fte, 5)) %>% 
+  group_by(employee_ntile) %>% 
+   summarize(
+    uren_man = sum(uren_man),
+    uren_vrouw = sum(uren_vrouw),
+    personeelskost_man = sum(personeelskost_man), 
+    personeelskost_vrouw = sum(personeelskost_vrouw)
+         ) %>% 
+  ungroup() %>% 
+    mutate(
+    uurloon_man = personeelskost_man / uren_man,
+    uurloon_vrouw = personeelskost_vrouw / uren_vrouw,
+    loonkloof = ((uurloon_vrouw - uurloon_man) / uurloon_man)
+  ) %>% 
+arrange(desc(abs(loonkloof)))
+
+employee_ntile_payGap
+  
+employee_ntile_payGap %>% 
+  ggplot(aes(x=employee_ntile, y=loonkloof)) +
+  geom_col() +
+  labs(title="Bedrijven met weinig werknemers hebben een grotere loonkloof")
+
+```
+
+## Evolutie
+
+### Aantal bedrijven per jaar
+De historiek van de bedrijven uit onze staal is eerder beperkt. Van de 70 bedrijven die we voor jaar 2022 selecteerden zin er tegen 2018 slechts 43 waarvoor data beschikbaar.
+```{r}
+df_full %>% 
+  select(name_nl, year, sector, loonkloof) %>% 
+  group_by(year) %>% 
+  summarize(n())
+```
+
+### Algemeen
+```{r}
+evo_median <- df_full %>% 
+  group_by(year) %>% 
+  summarize(loonkloof=median(abs(loonkloof), na.rm=T)) %>% 
+  mutate(year = as.character(year(year))) 
+
+evo_median %>% 
+  ggplot(aes(x=year, y=loonkloof)) +
+  geom_col()
+
+df_full %>% 
+  mutate(year = as.character(year(year))) %>% 
+  mutate(loonkloof = abs(loonkloof)) %>% 
+  ggplot(aes(x=year, y=loonkloof)) +
+  geom_violin(fill="#ece5dc", col="transparent") +
+  geom_dotplot(binaxis='y', stackdir='center', dotsize=0.4) +
+  geom_point(data=evo_median, aes(x=year, y=loonkloof), col="red") +
+  theme_minimal()
+  
+```
+
+
+## Kostprijs 
+
+### Algemeen - Loonkloof naar 5 en 0%
+```{r}
+df_full_current %>% 
+  summarize(
+    kosten_naar_0pct = sum(kosten_naar_0pct, na.rm=T),
+    kosten_naar_5pct = sum(kosten_naar_5pct, na.rm=T)
+  )
+```
+### Top 10 -  Kostprijs naar 5%
+```{r}
+df_full_current %>% 
+  filter(cat_loonkloof == "<-5%") %>% 
+  arrange(desc(kosten_naar_5pct)) %>% 
+  select(name_nl, loonkloof, kosten_naar_5pct, kosten_naar_0pct) 
+```
+
+### Kostprijs per sector
+```{r}
+df_full_current %>% 
+  group_by(sector) %>% 
+  filter(n() > 2) %>% 
+  summarize(
+    kosten_naar_0pct = sum(kosten_naar_0pct, na.rm=T),
+    kosten_naar_5pct = sum(kosten_naar_5pct, na.rm=T)
+  ) %>% 
+  arrange(desc(kosten_naar_5pct))
+```
+
+# export tabel
+```{r}
+# df_full_current %>% write_sheet(ss="https://docs.google.com/spreadsheets/d/1MclclCt9OAQbO_T3e-og9R7h6skIdaeH2gBbi2z11Js/edit#gid=0", sheet="cijfers-loonkloofanalyse")
+```
+
+
+
+
+
