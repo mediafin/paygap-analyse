@@ -14,7 +14,7 @@ library(ggrepel)
 library(writexl)
 library(ggbeeswarm)
 
-options(scipen=999)
+#options(scipen=999)
 ```
 
 
